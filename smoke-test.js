@@ -47,6 +47,7 @@ let requests = [];
 let contentRows = [];
 let playerEvents = {};
 let videoEvents = {};
+let selectEvents = {};
 
 function follow(registry, name, cb) {
   if (!registry[name]) registry[name] = [];
@@ -121,7 +122,10 @@ const Lampa = {
   Explorer: function () { this.render = () => $(); this.appendFiles = () => {}; this.appendHead = () => {}; this.destroy = () => {}; },
   Filter: function () { this.render = () => $(); this.onSearch = null; this.onBack = null; this.onSelect = null; this.set = () => {}; this.chosen = () => {}; this.show = () => {}; this.addButtonBack = () => {}; },
   Arrays: { extend: (a, b) => Object.assign(a, b), remove: (a, v) => { const i = a.indexOf(v); if (i >= 0) a.splice(i, 1); } },
-  Select: { show: () => {}, close: () => {} },
+  Select: {
+    show: () => {}, close: () => {},
+    listener: { follow: (name, cb) => follow(selectEvents, name, cb) }
+  },
   Helper: { show: () => {} },
   Timeline: { view: () => ({ percent: 0, time: 0, duration: 0 }), render: () => $(), update: () => {} },
   Account: { logged: () => false, subscribeToTranslation: () => {} },
@@ -208,6 +212,22 @@ if (fullListener && fullListener.cb) {
     console.error('FAIL listener.cb threw:', e.stack || e);
     fail++;
   }
+}
+
+// The native Lampa favorite dialog must expose the KinoPub folder picker.
+try {
+  const favoriteMenu = {
+    title: 'settings_input_links',
+    items: [{ title: 'title_book', type: 'book', checkbox: true }]
+  };
+  (selectEvents.preshow || []).forEach((cb) => cb({ active: favoriteMenu }));
+  const kpMenuItem = favoriteMenu.items.find((item) => item && item._kpBookmarks && !item.separator);
+  if (!kpMenuItem || typeof kpMenuItem.onSelect !== 'function') throw new Error('KinoPub picker missing from favorite dialog');
+  console.log('OK   native favorite dialog includes KinoPub picker');
+  pass++;
+} catch (e) {
+  console.error('FAIL KinoPub favorite dialog integration:', e.stack || e);
+  fail++;
 }
 
 // A KinoPub play element must emit a marktime request after 30+ seconds.

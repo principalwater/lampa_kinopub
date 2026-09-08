@@ -23,7 +23,7 @@
    *  CONSTANTS                                                   *
    * ============================================================ */
 
-  var PLUGIN_VERSION  = '1.1.0-beta.1';
+  var PLUGIN_VERSION  = '1.1.0-beta.2';
   // Public manifest-proxy URL — set near KP_PROXY_URL declaration below.
   var COMPONENT_NAME  = 'online_kp';
   var BALANSER        = 'kpapi';
@@ -75,6 +75,7 @@
   var kpUserId = null;
   var kpVoiceSyncDebounce = {};
   var KP_VOICE_SYNC_DEBOUNCE_MS = 2000;
+  var kpBookmarkMovie = null;
 
   // OAuth credentials of the public xbmc/Kodi-style client used by
   // virtually every unofficial kinopub client. Documented in many
@@ -2101,9 +2102,13 @@
       });
   }
 
-  function openKpBookmarkPicker(movie) {
-    if (!KP.hasToken()) return openAuthModal(function () { openKpBookmarkPicker(movie); });
-    var enabled = Lampa.Controller.enabled().name;
+  function openKpBookmarkPicker(movie, returnController) {
+    if (!KP.hasToken()) return openAuthModal(function () { openKpBookmarkPicker(movie, returnController); });
+    var enabled = returnController || Lampa.Controller.enabled().name;
+    var fail = function (message) {
+      Lampa.Noty.show(message);
+      Lampa.Controller.toggle(enabled);
+    };
     Lampa.Noty.show(Lampa.Lang.translate('kp_bookmarks_loading'));
     resolveKpMovie(movie, function (kpItem) {
       KP.bookmarks(new Lampa.Reguest(), function (foldersJson) {
@@ -2133,9 +2138,9 @@
               });
             }
           });
-        }, function () { Lampa.Noty.show(Lampa.Lang.translate('kp_bookmark_failed')); });
-      }, function () { Lampa.Noty.show(Lampa.Lang.translate('kp_bookmark_failed')); });
-    }, function () { Lampa.Noty.show(Lampa.Lang.translate('online_balanser_dont_work')); });
+        }, function () { fail(Lampa.Lang.translate('kp_bookmark_failed')); });
+      }, function () { fail(Lampa.Lang.translate('kp_bookmark_failed')); });
+    }, function () { fail(Lampa.Lang.translate('online_balanser_dont_work')); });
   }
 
   function parseFiles(files) {
@@ -4543,6 +4548,26 @@
     // settings
     addSettings();
 
+    // Add KinoPub to Lampa's native favorite dialog. The current full-card UI
+    // keeps source buttons in a hidden container, so a separate button there
+    // is not discoverable.
+    if (Lampa.Select && Lampa.Select.listener && Lampa.Select.listener.follow) {
+      Lampa.Select.listener.follow('preshow', function (e) {
+        var active = e && e.active;
+        if (!active || !kpBookmarkMovie || active.title !== Lampa.Lang.translate('settings_input_links') || !active.items) return;
+        if (!active.items.some(function (item) { return item && (item.type === 'book' || item.where === 'book'); })) return;
+        if (active.items.some(function (item) { return item && item._kpBookmarks; })) return;
+
+        var enabled = Lampa.Controller.enabled().name;
+        active.items.push({ title: 'KinoPub', separator: true, _kpBookmarks: true });
+        active.items.push({
+          title: Lampa.Lang.translate('kp_bookmarks_title'),
+          _kpBookmarks: true,
+          onSelect: function () { openKpBookmarkPicker(kpBookmarkMovie, enabled); }
+        });
+      });
+    }
+
     // button on movie card
     var button = '' +
       '<div class="full-start__button selector view--online" data-subtitle="KinoPub v' + PLUGIN_VERSION + '">' +
@@ -4553,16 +4578,9 @@
         '<span>KinoPub</span>' +
       '</div>';
 
-    var bookmarkButton = '' +
-      '<div class="full-start__button selector view--kp-bookmarks" data-subtitle="' + Lampa.Lang.translate('kp_bookmarks_title') + '">' +
-        '<svg width="128" height="147" viewBox="0 0 128 147" fill="none" xmlns="http://www.w3.org/2000/svg">' +
-          '<path d="M22 10h84a8 8 0 0 1 8 8v116l-50-29-50 29V18a8 8 0 0 1 8-8Z" stroke="currentColor" stroke-width="10" stroke-linejoin="round"/>' +
-        '</svg>' +
-        '<span>' + Lampa.Lang.translate('kp_bookmarks_title') + '</span>' +
-      '</div>';
-
     Lampa.Listener.follow('full', function (e) {
       if (e.type !== 'complite') return;
+      kpBookmarkMovie = e.data && e.data.movie;
       // v1.0.66: pre-fetch voice-sync snapshot from VPS so Storage is
       // populated BEFORE user clicks the kinopub button.
       try {
@@ -4571,26 +4589,20 @@
       } catch (vse) {}
       try {
         var btn = $(Lampa.Lang.translate(button));
-        var bookmarkBtn = $(bookmarkButton);
         btn.on('hover:enter', function () {
           resetTemplates();
           Lampa.Component.add(COMPONENT_NAME, component);
           launchActivity(e.data.movie);
         });
-        bookmarkBtn.on('hover:enter', function () { openKpBookmarkPicker(e.data.movie); });
         var holder = e.object.activity.render();
         var anchor = holder.find('.view--torrent');
         if (anchor.length) {
           anchor.after(btn);
-          btn.after(bookmarkBtn);
         }
         else {
           var buttons = holder.find('.full-start-new__buttons, .full-start__buttons').first();
-          if (buttons.length) buttons.append(btn).append(bookmarkBtn);
-          else {
-            holder.find('.full-start__button').first().after(btn);
-            btn.after(bookmarkBtn);
-          }
+          if (buttons.length) buttons.append(btn);
+          else holder.find('.full-start__button').first().after(btn);
         }
       } catch (err) {
         Logger.error('button', 'mount failed', String(err));
