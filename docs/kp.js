@@ -23,7 +23,7 @@
    *  CONSTANTS                                                   *
    * ============================================================ */
 
-  var PLUGIN_VERSION  = '1.0.73';
+  var PLUGIN_VERSION  = '1.1.0-beta.1';
   // Public manifest-proxy URL — set near KP_PROXY_URL declaration below.
   var COMPONENT_NAME  = 'online_kp';
   var BALANSER        = 'kpapi';
@@ -93,6 +93,7 @@
   var KEY_FORMAT      = 'kp_format';
   var KEY_PROXY       = 'kp_proxy';
   var KEY_SUBS        = 'kp_subtitles_enabled';
+  var KEY_BOOKMARKS   = 'kp_bookmarks_cache_v1';
 
   /* ============================================================ *
    *  LOGGER                                                      *
@@ -531,6 +532,32 @@
       },
       item: function (network, id, ok, err) {
         api(network, '/items/' + id, null, ok, err);
+      },
+      watching: function (network, id, ok, err) {
+        api(network, '/watching', { id: id }, ok, err);
+      },
+      markTime: function (network, id, video, time, season, ok, err) {
+        api(network, '/watching/marktime', {
+          id: id,
+          video: video,
+          time: Math.max(0, Math.round(time || 0)),
+          season: season
+        }, ok, err);
+      },
+      bookmarks: function (network, ok, err) {
+        api(network, '/bookmarks', null, ok, err);
+      },
+      bookmarkItems: function (network, folder, page, ok, err) {
+        api(network, '/bookmarks/' + folder, { page: page || 1, perpage: 100 }, ok, err);
+      },
+      bookmarkFoldersForItem: function (network, item, ok, err) {
+        api(network, '/bookmarks/get-item-folders', { item: item }, ok, err);
+      },
+      addBookmark: function (network, item, folder, ok, err) {
+        apiPost(network, '/bookmarks/add', { item: item, folder: folder }, ok, err);
+      },
+      removeBookmark: function (network, item, folder, ok, err) {
+        apiPost(network, '/bookmarks/remove-item', { item: item, folder: folder }, ok, err);
       },
       profile: function (network, ok, err) {
         api(network, '/user', null, ok, err);
@@ -1901,6 +1928,216 @@
     return { rus: s, orig: '' };
   }
 
+  function kpMovieMeta(movie) {
+    movie = movie || {};
+    var imdbRaw = movie.imdb_id || (movie.external_ids && movie.external_ids.imdb_id) || '';
+    return {
+      year: parseInt((movie.release_date || movie.first_air_date || '0000').slice(0, 4), 10),
+      orig: movie.original_name || movie.original_title || '',
+      rus: movie.name || movie.title || '',
+      imdb: imdbRaw ? parseInt(String(imdbRaw).replace(/^tt/i, ''), 10) : 0,
+      serial: !!(movie.name || movie.first_air_date || movie.number_of_seasons)
+    };
+  }
+
+  function pickKpMatch(items, movie) {
+    var meta = kpMovieMeta(movie);
+    var found = null;
+
+    if (meta.imdb) {
+      found = items.find(function (c) { return parseInt(c.imdb || 0, 10) === meta.imdb; });
+    }
+    if (!found) {
+      found = items.find(function (c) {
+        var title = splitKpTitle(c.title);
+        var typeOk = meta.serial ? /serial|tvshow/i.test(c.type || '')
+                                 : !/serial|tvshow/i.test(c.type || '');
+        var titleOk = (meta.orig && normalize(title.orig) === normalize(meta.orig)) ||
+                      (meta.rus && normalize(title.rus) === normalize(meta.rus));
+        return typeOk && Math.abs(parseInt(c.year || 0, 10) - meta.year) <= 1 && titleOk;
+      });
+    }
+    if (!found) {
+      found = items.find(function (c) {
+        var title = splitKpTitle(c.title);
+        return Math.abs(parseInt(c.year || 0, 10) - meta.year) <= 1 && (
+          (meta.orig && normalize(title.orig) === normalize(meta.orig)) ||
+          (meta.rus && normalize(title.rus) === normalize(meta.rus))
+        );
+      });
+    }
+    return found || (items.length === 1 ? items[0] : null);
+  }
+
+  function resolveKpMovie(movie, success, error) {
+    if (movie && movie._kp_id) return success({ id: movie._kp_id });
+    var meta = kpMovieMeta(movie);
+    var query = meta.rus || meta.orig;
+    if (!query) return error();
+    KP.search(new Lampa.Reguest(), query, meta.serial ? 'serial' : 'movie', function (json) {
+      var found = pickKpMatch((json && json.items) || [], movie);
+      if (found) success(found);
+      else error();
+    }, error);
+  }
+
+  var kpActivePlayback = null;
+
+  function syncKpPlayback(data, force) {
+    if (!kpActivePlayback || !data) return;
+    var current = Number(data.current || 0);
+    if (current <= 0) return;
+    if (!force && Date.now() - kpActivePlayback.sentAt < 30000) return;
+    if (force && Math.abs(current - kpActivePlayback.sentTime) < 1) return;
+
+    var active = kpActivePlayback;
+    active.sentAt = Date.now();
+    active.sentTime = current;
+    KP.markTime(new Lampa.Reguest(), active.id, active.video,
+      current, active.season, function () {
+        Logger.debug('sync', 'progress saved', { id: active.id, time: Math.round(current) });
+      }, function (xhr, status) {
+        Logger.warn('sync', 'progress save failed', { http: xhr && xhr.status, status: status });
+      });
+  }
+
+  var kpBookmarksRefreshing = false;
+
+  function bookmarkCache() {
+    var cache = Lampa.Storage.get(KEY_BOOKMARKS, { folders: [] });
+    if (typeof cache === 'string') {
+      try { cache = JSON.parse(cache); } catch (e) { cache = { folders: [] }; }
+    }
+    return cache && cache.folders ? cache : { folders: [] };
+  }
+
+  function refreshKpBookmarks(done) {
+    if (!KP.hasToken() || kpBookmarksRefreshing) return done && done(false);
+    kpBookmarksRefreshing = true;
+    KP.bookmarks(new Lampa.Reguest(), function (json) {
+      var folders = (json && json.items) || [];
+      var pending = folders.length;
+      var failed = false;
+      var result = [];
+
+      function finish() {
+        if (--pending > 0) return;
+        kpBookmarksRefreshing = false;
+        if (!failed) Lampa.Storage.set(KEY_BOOKMARKS, { updated: Date.now(), folders: result });
+        if (done) done(!failed);
+      }
+
+      function loadFolder(folder, index) {
+        var items = [];
+        function loadPage(page) {
+          KP.bookmarkItems(new Lampa.Reguest(), folder.id, page, function (pageJson) {
+            items = items.concat((pageJson && pageJson.items) || []);
+            var p = (pageJson && pageJson.pagination) || {};
+            var current = parseInt(p.current || page, 10);
+            var perpage = parseInt(p.perpage || items.length || 1, 10);
+            var total = parseInt(p.total || items.length, 10);
+            if (current * perpage < total) loadPage(current + 1);
+            else {
+              result[index] = { id: folder.id, title: folder.title, items: items };
+              finish();
+            }
+          }, function () { failed = true; finish(); });
+        }
+        loadPage(1);
+      }
+
+      if (!pending) {
+        kpBookmarksRefreshing = false;
+        Lampa.Storage.set(KEY_BOOKMARKS, { updated: Date.now(), folders: [] });
+        return done && done(true);
+      }
+      folders.forEach(loadFolder);
+    }, function (xhr, status) {
+      kpBookmarksRefreshing = false;
+      Logger.warn('sync', 'bookmark refresh failed', { http: xhr && xhr.status, status: status });
+      if (done) done(false);
+    });
+  }
+
+  function kpBookmarkCard(item) {
+    var title = splitKpTitle(item.title);
+    var serial = /serial|tvshow/i.test(item.type || '');
+    var posters = item.posters || {};
+    var card = {
+      id: Number(item.id),
+      _kp_id: Number(item.id),
+      source: 'kp',
+      year: item.year,
+      release_date: item.year ? item.year + '-01-01' : '',
+      poster: posters.medium || posters.big || posters.small || '',
+      vote_average: item.imdb_rating || item.kinopoisk_rating || item.rating || 0,
+      params: { emit: {} }
+    };
+    if (serial) {
+      card.name = title.rus || item.title;
+      card.original_name = title.orig || '';
+      card.first_air_date = card.release_date;
+    } else {
+      card.title = title.rus || item.title;
+      card.original_title = title.orig || '';
+    }
+    card.params.emit.onEnter = function () { launchActivity(card); };
+    card.params.emit.onFocus = function () {
+      if (Lampa.Background && Lampa.Background.change) Lampa.Background.change(card.poster || '');
+    };
+    return card;
+  }
+
+  function kpBookmarkRows() {
+    var cache = bookmarkCache();
+    if (!cache.updated || cache.updated < Date.now() - 5 * 60 * 1000) refreshKpBookmarks();
+    return cache.folders.filter(function (folder) { return folder.items && folder.items.length; })
+      .map(function (folder) {
+        return {
+          title: 'KinoPub — ' + folder.title,
+          results: folder.items.map(kpBookmarkCard),
+          total_pages: 1
+        };
+      });
+  }
+
+  function openKpBookmarkPicker(movie) {
+    if (!KP.hasToken()) return openAuthModal(function () { openKpBookmarkPicker(movie); });
+    var enabled = Lampa.Controller.enabled().name;
+    Lampa.Noty.show(Lampa.Lang.translate('kp_bookmarks_loading'));
+    resolveKpMovie(movie, function (kpItem) {
+      KP.bookmarks(new Lampa.Reguest(), function (foldersJson) {
+        KP.bookmarkFoldersForItem(new Lampa.Reguest(), kpItem.id, function (activeJson) {
+          var active = (activeJson && activeJson.folders) || [];
+          var items = ((foldersJson && foldersJson.items) || []).map(function (folder) {
+            return {
+              id: folder.id,
+              title: folder.title,
+              checkbox: true,
+              checked: !!active.find(function (a) { return Number(a.id) === Number(folder.id); })
+            };
+          });
+          Lampa.Select.show({
+            title: Lampa.Lang.translate('kp_bookmarks_title'),
+            items: items,
+            onBack: function () { Lampa.Controller.toggle(enabled); },
+            onCheck: function (folder, html) {
+              var action = folder.checked ? KP.addBookmark : KP.removeBookmark;
+              action(new Lampa.Reguest(), kpItem.id, folder.id, function () {
+                refreshKpBookmarks();
+                Lampa.Noty.show(Lampa.Lang.translate(folder.checked ? 'kp_bookmark_added' : 'kp_bookmark_removed'));
+              }, function () {
+                folder.checked = !folder.checked;
+                html.toggleClass('selectbox-item--checked', folder.checked);
+                Lampa.Noty.show(Lampa.Lang.translate('kp_bookmark_failed'));
+              });
+            }
+          });
+        }, function () { Lampa.Noty.show(Lampa.Lang.translate('kp_bookmark_failed')); });
+      }, function () { Lampa.Noty.show(Lampa.Lang.translate('kp_bookmark_failed')); });
+    }, function () { Lampa.Noty.show(Lampa.Lang.translate('online_balanser_dont_work')); });
+  }
+
   function parseFiles(files) {
     if (!files || !files.length) return [];
     var arr = [];
@@ -2173,6 +2410,7 @@
           // Send device identity once we have token so kinopub UI shows
           // a friendly name instead of three "unknown".
           notifyDeviceIdentity(new Lampa.Reguest());
+          refreshKpBookmarks();
           if (onSuccess) {
             try { onSuccess(); } catch (e) { Logger.error('auth', 'onSuccess threw', String(e)); }
           } else {
@@ -2205,6 +2443,7 @@
     var object  = _object;
 
     var raw      = null;          // /v1/items/{id} response
+    var rawWatching = null;       // /v1/watching response
     var extract  = null;          // normalized
     var choice   = { season: 0, voice: 0, voice_name: '' };
     var filterItems = {};
@@ -2234,22 +2473,12 @@
     this.searchByTitle = function (_object_, query) {
       var self = this;
       object = _object_;
-
-      var year = parseInt((object.movie.release_date || object.movie.first_air_date || '0000').slice(0, 4), 10);
-      var orig = object.movie.original_name || object.movie.original_title || '';
-      var rus  = object.movie.name || object.movie.title || '';
-      // imdb id may live on the movie object itself or under external_ids
-      var imdbRaw = object.movie.imdb_id ||
-                    (object.movie.external_ids && object.movie.external_ids.imdb_id) ||
-                    '';
-      var imdbNum = imdbRaw ? parseInt(String(imdbRaw).replace(/^tt/i, ''), 10) : 0;
-      // serial detection: TMDB tv-show carries `name` and `first_air_date`
-      var isSerial = !!(object.movie.name || object.movie.first_air_date || object.movie.number_of_seasons);
-      var typeFilter = isSerial ? 'serial' : 'movie';
+      var meta = kpMovieMeta(object.movie);
+      var typeFilter = meta.serial ? 'serial' : 'movie';
 
       Logger.info('source', 'searchByTitle', {
-        query: query, year: year, orig: orig, rus: rus,
-        imdb: imdbRaw, imdbNum: imdbNum, type: typeFilter
+        query: query, year: meta.year, orig: meta.orig, rus: meta.rus,
+        imdb: meta.imdb, type: typeFilter
       });
 
       network.clear();
@@ -2265,48 +2494,7 @@
           Logger.debug('source', 'top candidates', preview);
         }
 
-        var card = null;
-
-        // 1) IMDB ID exact match — by far the most reliable, skips title noise
-        if (imdbNum) {
-          card = items.find(function (c) {
-            return parseInt(c.imdb || 0, 10) === imdbNum;
-          });
-          if (card) Logger.info('source', 'matched by imdb', { id: card.id, imdb: card.imdb });
-        }
-
-        // 2) type + year(±1) + parsed title match
-        if (!card) {
-          card = items.find(function (c) {
-            var cy = parseInt(c.year || 0, 10);
-            var t = splitKpTitle(c.title);
-            var typeOk = isSerial ? /serial|tvshow/i.test(c.type || '')
-                                  : !/serial|tvshow/i.test(c.type || '');
-            var titleOk = (orig && normalize(t.orig) === normalize(orig)) ||
-                          (rus  && normalize(t.rus)  === normalize(rus));
-            return typeOk && Math.abs(cy - year) <= 1 && titleOk;
-          });
-          if (card) Logger.info('source', 'matched by title+year+type', { id: card.id, year: card.year });
-        }
-
-        // 3) loose title+year (any type) — TMDB and kinopub may disagree on type
-        if (!card) {
-          card = items.find(function (c) {
-            var cy = parseInt(c.year || 0, 10);
-            var t = splitKpTitle(c.title);
-            return Math.abs(cy - year) <= 1 && (
-              (orig && normalize(t.orig) === normalize(orig)) ||
-              (rus  && normalize(t.rus)  === normalize(rus))
-            );
-          });
-          if (card) Logger.info('source', 'matched by title+year (loose)', { id: card.id });
-        }
-
-        // 4) single hit — trust it
-        if (!card && items.length === 1) {
-          card = items[0];
-          Logger.info('source', 'single result, taking it', { id: card.id });
-        }
+        var card = pickKpMatch(items, object.movie);
 
         if (card) {
           Logger.info('source', 'matched card', { id: card.id, title: card.title, year: card.year, type: card.type });
@@ -2336,13 +2524,24 @@
           component.doesNotAnswer();
           return;
         }
-        try {
-          success(json.item);
-          component.loading(false);
-        } catch (e) {
-          Logger.error('source', 'parse error', { msg: String(e), stack: String(e && e.stack).slice(0, 600) });
-          component.doesNotAnswer();
-        }
+        KP.watching(network, id, function (watchingJson) {
+          try {
+            success(json.item, watchingJson);
+            component.loading(false);
+          } catch (e) {
+            Logger.error('source', 'parse error', { msg: String(e), stack: String(e && e.stack).slice(0, 600) });
+            component.doesNotAnswer();
+          }
+        }, function () {
+          Logger.warn('sync', 'remote progress unavailable, using item payload');
+          try {
+            success(json.item, null);
+            component.loading(false);
+          } catch (e) {
+            Logger.error('source', 'fallback parse error', { msg: String(e), stack: String(e && e.stack).slice(0, 600) });
+            component.doesNotAnswer();
+          }
+        });
       }, function (xhr, status) {
         Logger.error('source', 'find error', { http: xhr && xhr.status, status: status });
         component.doesNotAnswer();
@@ -2356,7 +2555,7 @@
       component.reset();
       choice = { season: 0, voice: 0, voice_name: '' };
       if (raw) {
-        extractData(raw);
+        extractData(raw, rawWatching);
         buildFilter();
         append(filtered());
       }
@@ -2390,6 +2589,7 @@
       Logger.debug('source', 'destroy');
       network.clear();
       raw = null;
+      rawWatching = null;
       extract = null;
     };
 
@@ -2413,7 +2613,7 @@
       };
     }
 
-    function success(item) {
+    function success(item, watchingJson) {
       Logger.info('source', 'item loaded', {
         id: item.id, type: item.type,
         seasons: (item.seasons || []).length,
@@ -2436,7 +2636,8 @@
         }
       } catch (e) { Logger.warn('source', 'audio sample dump failed', String(e)); }
       raw = item;
-      extractData(item);
+      rawWatching = watchingJson;
+      extractData(item, watchingJson);
       buildFilter();
       append(filtered());
     }
@@ -2464,8 +2665,9 @@
     }
 
 
-    function extractData(item) {
+    function extractData(item, watchingJson) {
       extract = { type: 'movie', seasons: [], movie: null };
+      var watchingItem = watchingJson && watchingJson.item || {};
 
       var hasSeasons = item.seasons && item.seasons.length;
       var hasVideos  = item.videos  && item.videos.length;
@@ -2473,14 +2675,23 @@
       if (hasSeasons) {
         extract.type = 'serial';
         extract.seasons = (item.seasons || []).map(function (s) {
+          var remoteSeason = (watchingItem.seasons || []).find(function (ws) {
+            return Number(ws.number) === Number(s.number);
+          }) || {};
           return {
             number:   s.number,
             episodes: (s.episodes || []).map(function (ep, idx) {
+              var remote = (remoteSeason.episodes || []).find(function (we) {
+                return Number(we.number) === Number(ep.number || idx + 1);
+              }) || ep.watching || {};
               return {
                 id:        ep.id || (s.number + '_' + (ep.number || idx + 1)),
                 number:    ep.number || idx + 1,
                 title:     ep.title || '',
                 thumb:     ep.thumbnail,
+                duration:  ep.duration || 0,
+                remoteTime: Number(remote.time || 0),
+                remoteStatus: Number(remote.status || 0),
                 files:     parseFiles(ep.files),
                 audios:    ep.audios || [],
                 subtitles: ep.subtitles || []
@@ -2502,7 +2713,14 @@
       } else if (hasVideos) {
         extract.type = 'movie';
         var v = item.videos[0];
+        var remoteVideo = (watchingItem.videos || []).find(function (wv) {
+          return Number(wv.number) === Number(v.number);
+        }) || v.watching || {};
         extract.movie = {
+          number:    v.number,
+          duration:  v.duration || 0,
+          remoteTime: Number(remoteVideo.time || 0),
+          remoteStatus: Number(remoteVideo.status || 0),
           files:     parseFiles(v.files),
           audios:    v.audios || [],
           subtitles: v.subtitles || []
@@ -2595,7 +2813,11 @@
         return season.episodes.map(function (ep) {
           var stream = pickStream(ep.files, fmt);
           return {
-            kp:           { kind: 'episode', files: ep.files, audios: ep.audios, subtitles: ep.subtitles },
+            kp:           {
+              kind: 'episode', item: raw.id, video: ep.number, season: season.number,
+              duration: ep.duration, remoteTime: ep.remoteTime, remoteStatus: ep.remoteStatus,
+              files: ep.files, audios: ep.audios, subtitles: ep.subtitles
+            },
             episode:      ep.number,
             season:       season.number,
             // display title for the in-source episode list (filmix-style)
@@ -2616,7 +2838,12 @@
       } else if (extract.type === 'movie' && extract.movie) {
         var stream2 = pickStream(extract.movie.files, fmt);
         return [{
-          kp:          { kind: 'movie', files: extract.movie.files, audios: extract.movie.audios, subtitles: extract.movie.subtitles },
+          kp:          {
+            kind: 'movie', item: raw.id, video: extract.movie.number,
+            duration: extract.movie.duration, remoteTime: extract.movie.remoteTime,
+            remoteStatus: extract.movie.remoteStatus,
+            files: extract.movie.files, audios: extract.movie.audios, subtitles: extract.movie.subtitles
+          },
           title:       (object.movie && (object.movie.title || object.movie.name)) || '',
           quality:     stream2 ? (stream2.currentQuality + 'p ') : '',
           translation: 1,
@@ -2688,6 +2915,13 @@
         timeline: element.timeline,
         callback: element.mark
       };
+      if (element.kp && element.kp.item && element.kp.video) {
+        play._kpSync = {
+          id: element.kp.item,
+          video: element.kp.video,
+          season: element.kp.season
+        };
+      }
 
       // ── Voice selection ────────────────────────────────────────────────
       // Filter is the canonical UI for picking voice (choice.voice_key).
@@ -3176,6 +3410,11 @@
     };
 
     this.find = function () {
+      if (object.movie && object.movie._kp_id && source && source.find) {
+        this.extendChoice();
+        source.find(object.movie._kp_id);
+        return;
+      }
       if (source && source.searchByTitle) {
         this.extendChoice();
         var q = object.search || object.movie.original_title || object.movie.original_name ||
@@ -3373,6 +3612,13 @@
 
           var info = [];
           element.timeline = Lampa.Timeline.view(hash_timeline);
+          if (element.kp && element.kp.duration) {
+            element.timeline.time = Math.max(0, Number(element.kp.remoteTime || 0));
+            element.timeline.duration = Number(element.kp.duration || 0);
+            element.timeline.percent = element.kp.remoteStatus === 1
+              ? 100
+              : Math.min(100, Math.round(element.timeline.time / element.timeline.duration * 100));
+          }
           // Expose hash so onEnter can save remembered voice keyed by episode
           element.timeline_hash = hash_timeline;
 
@@ -3487,6 +3733,12 @@
             element.timeline.time = 0;
             element.timeline.duration = 0;
             Lampa.Timeline.update(element.timeline);
+            if (element.kp && element.kp.item && element.kp.video) {
+              KP.markTime(new Lampa.Reguest(), element.kp.item, element.kp.video, 0,
+                element.kp.season, function () {}, function () {
+                  Lampa.Noty.show(Lampa.Lang.translate('kp_progress_failed'));
+                });
+            }
             // Drop the remembered voice for this episode — episode is "fresh" now
             try {
               var wmap = Lampa.Storage.cache('kp_episode_voice', 5000, {});
@@ -3517,7 +3769,7 @@
           html.data('kp-card', { element: element, activeVoiceKey: choice.voice_key || '' });
 
           html.on('hover:enter', function () {
-            if (object.movie.id) Lampa.Favorite.add('history', object.movie, 100);
+            if (object.movie.id && !object.movie._kp_id) Lampa.Favorite.add('history', object.movie, 100);
             if (params.onEnter) params.onEnter(element, html, {});
           }).on('hover:focus', function (e) {
             last = e.target;
@@ -3976,6 +4228,17 @@
 
     Lampa.SettingsApi.addParam({
       component: 'kp',
+      param: { name: 'kp_action_sync', type: 'trigger', "default": false },
+      field: { name: Lampa.Lang.translate('kp_set_sync'), description: Lampa.Lang.translate('kp_set_sync_descr') },
+      onChange: function () {
+        refreshKpBookmarks(function (ok) {
+          Lampa.Noty.show(Lampa.Lang.translate(ok ? 'kp_sync_done' : 'kp_sync_failed'));
+        });
+      }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'kp',
       param: { name: 'kp_action_logout', type: 'trigger', "default": false },
       field: { name: Lampa.Lang.translate('kp_set_logout'), description: Lampa.Lang.translate('kp_set_logout_descr') },
       onChange: function () {
@@ -4050,6 +4313,56 @@
         ru: 'Смотреть на kinopub',
         en: 'Watch on kinopub',
         ua: 'Дивитися на kinopub'
+      },
+      kp_bookmarks_title: {
+        ru: 'Закладки KinoPub',
+        en: 'KinoPub bookmarks',
+        ua: 'Закладки KinoPub'
+      },
+      kp_bookmarks_loading: {
+        ru: 'Загружаю закладки KinoPub...',
+        en: 'Loading KinoPub bookmarks...',
+        ua: 'Завантажую закладки KinoPub...'
+      },
+      kp_bookmark_added: {
+        ru: 'Добавлено в KinoPub',
+        en: 'Added to KinoPub',
+        ua: 'Додано в KinoPub'
+      },
+      kp_bookmark_removed: {
+        ru: 'Удалено из KinoPub',
+        en: 'Removed from KinoPub',
+        ua: 'Видалено з KinoPub'
+      },
+      kp_bookmark_failed: {
+        ru: 'Не удалось изменить закладки KinoPub',
+        en: 'Failed to update KinoPub bookmarks',
+        ua: 'Не вдалося змінити закладки KinoPub'
+      },
+      kp_progress_failed: {
+        ru: 'Не удалось сбросить прогресс KinoPub',
+        en: 'Failed to reset KinoPub progress',
+        ua: 'Не вдалося скинути прогрес KinoPub'
+      },
+      kp_set_sync: {
+        ru: 'Обновить закладки KinoPub',
+        en: 'Refresh KinoPub bookmarks',
+        ua: 'Оновити закладки KinoPub'
+      },
+      kp_set_sync_descr: {
+        ru: 'Загрузить папки и фильмы из аккаунта KinoPub в раздел закладок Lampa',
+        en: 'Load folders and titles from KinoPub into the Lampa bookmarks screen',
+        ua: 'Завантажити папки й фільми KinoPub до розділу закладок Lampa'
+      },
+      kp_sync_done: {
+        ru: 'Закладки KinoPub обновлены',
+        en: 'KinoPub bookmarks refreshed',
+        ua: 'Закладки KinoPub оновлено'
+      },
+      kp_sync_failed: {
+        ru: 'Не удалось обновить закладки KinoPub',
+        en: 'Failed to refresh KinoPub bookmarks',
+        ua: 'Не вдалося оновити закладки KinoPub'
       },
       kp_auth_title: {
         ru: 'Авторизация kinopub',
@@ -4217,6 +4530,15 @@
     resetTemplates();
 
     Lampa.Component.add(COMPONENT_NAME, component);
+    if (Lampa.ContentRows && Lampa.ContentRows.add) {
+      Lampa.ContentRows.add({
+        name: 'kinopub_bookmarks',
+        title: Lampa.Lang.translate('kp_bookmarks_title'),
+        index: 0,
+        screen: ['bookmarks'],
+        call: kpBookmarkRows
+      });
+    }
 
     // settings
     addSettings();
@@ -4231,6 +4553,14 @@
         '<span>KinoPub</span>' +
       '</div>';
 
+    var bookmarkButton = '' +
+      '<div class="full-start__button selector view--kp-bookmarks" data-subtitle="' + Lampa.Lang.translate('kp_bookmarks_title') + '">' +
+        '<svg width="128" height="147" viewBox="0 0 128 147" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+          '<path d="M22 10h84a8 8 0 0 1 8 8v116l-50-29-50 29V18a8 8 0 0 1 8-8Z" stroke="currentColor" stroke-width="10" stroke-linejoin="round"/>' +
+        '</svg>' +
+        '<span>' + Lampa.Lang.translate('kp_bookmarks_title') + '</span>' +
+      '</div>';
+
     Lampa.Listener.follow('full', function (e) {
       if (e.type !== 'complite') return;
       // v1.0.66: pre-fetch voice-sync snapshot from VPS so Storage is
@@ -4241,18 +4571,26 @@
       } catch (vse) {}
       try {
         var btn = $(Lampa.Lang.translate(button));
+        var bookmarkBtn = $(bookmarkButton);
         btn.on('hover:enter', function () {
           resetTemplates();
           Lampa.Component.add(COMPONENT_NAME, component);
           launchActivity(e.data.movie);
         });
+        bookmarkBtn.on('hover:enter', function () { openKpBookmarkPicker(e.data.movie); });
         var holder = e.object.activity.render();
         var anchor = holder.find('.view--torrent');
-        if (anchor.length) anchor.after(btn);
+        if (anchor.length) {
+          anchor.after(btn);
+          btn.after(bookmarkBtn);
+        }
         else {
           var buttons = holder.find('.full-start-new__buttons, .full-start__buttons').first();
-          if (buttons.length) buttons.append(btn);
-          else holder.find('.full-start__button').first().after(btn);
+          if (buttons.length) buttons.append(btn).append(bookmarkBtn);
+          else {
+            holder.find('.full-start__button').first().after(btn);
+            btn.after(bookmarkBtn);
+          }
         }
       } catch (err) {
         Logger.error('button', 'mount failed', String(err));
@@ -4261,6 +4599,7 @@
 
     // Background token health check
     if (KP.hasToken()) {
+      refreshKpBookmarks();
       var bg = new Lampa.Reguest();
       KP.profile(bg, function (j) {
         Logger.info('auth', 'profile ok', j && j.user && { name: j.user.username, subscribed: j.user.subscription });
@@ -4320,6 +4659,26 @@
         ['create', 'start', 'ready', 'destroy', 'external'].forEach(function (evt) {
           Lampa.Player.listener.follow(evt, function (e) { logEvt('Player', { type: evt }); });
         });
+        Lampa.Player.listener.follow('start', function (data) {
+          if (kpActivePlayback) {
+            syncKpPlayback({ current: kpActivePlayback.current, duration: kpActivePlayback.duration }, true);
+          }
+          kpActivePlayback = data && data._kpSync ? {
+            id: data._kpSync.id,
+            video: data._kpSync.video,
+            season: data._kpSync.season,
+            current: 0,
+            duration: 0,
+            sentAt: Date.now(),
+            sentTime: -1
+          } : null;
+        });
+        Lampa.Player.listener.follow('destroy', function () {
+          if (kpActivePlayback) {
+            syncKpPlayback({ current: kpActivePlayback.current, duration: kpActivePlayback.duration }, true);
+            kpActivePlayback = null;
+          }
+        });
         if (!KP_BARE_MODE) {
           // DOM injection for next-episode-name override
           Lampa.Player.listener.follow('start',   function () { setupNextEpisodeLabelOverride(); });
@@ -4368,6 +4727,18 @@
               });
             });
           });
+
+        Lampa.PlayerVideo.listener.follow('timeupdate', function (data) {
+          if (!kpActivePlayback || !data) return;
+          kpActivePlayback.current = Number(data.current || 0);
+          kpActivePlayback.duration = Number(data.duration || 0);
+          syncKpPlayback(data, false);
+        });
+        Lampa.PlayerVideo.listener.follow('ended', function () {
+          if (!kpActivePlayback) return;
+          var current = kpActivePlayback.duration || kpActivePlayback.current;
+          syncKpPlayback({ current: current, duration: kpActivePlayback.duration }, true);
+        });
 
         // v1.0.29-diag: always log AVPlayer track info on canplay.
         // Need to compare HLS2 vs HLS4 enumerated tracks to know whether

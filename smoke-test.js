@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const code = fs.readFileSync(path.join(__dirname, 'github', 'kp.js'), 'utf8');
+const code = fs.readFileSync(path.join(__dirname, 'docs', 'kp.js'), 'utf8');
 
 // jQuery-ish sham — the plugin only uses $('<...>'), .on, .find, .append, .text,
 // and as a function that returns a thenable-free wrapper.
@@ -40,9 +40,18 @@ const $ = makeJq();
 let kpComponentRegistered = null;
 let manifestSet = null;
 let langKeys = [];
-let listenerFollow = null;
+let listenerFollows = [];
 let settingsAdded = [];
 let storage = {};
+let requests = [];
+let contentRows = [];
+let playerEvents = {};
+let videoEvents = {};
+
+function follow(registry, name, cb) {
+  if (!registry[name]) registry[name] = [];
+  registry[name].push(cb);
+}
 
 const Lampa = {
   Manifest: {
@@ -59,7 +68,10 @@ const Lampa = {
     remove: () => {}
   },
   Reguest: function () {
-    this.silent = function () {};
+    this.silent = function (url, success, _error, postData) {
+      requests.push({ url, postData });
+      if (success) success({ status: 200 });
+    };
     this.quiet = function () {};
     this.native = function () {};
     this.timeout = function () {};
@@ -80,7 +92,7 @@ const Lampa = {
     add: (obj) => { langKeys = langKeys.concat(Object.keys(obj)); },
     translate: (k) => k
   },
-  Listener: { follow: (name, cb) => { listenerFollow = { name, cb }; } },
+  Listener: { follow: (name, cb) => { listenerFollows.push({ name, cb }); } },
   Manifest_set: null,
   Component: {
     add: (name, cls) => { if (name === 'online_kp') kpComponentRegistered = cls; },
@@ -96,7 +108,14 @@ const Lampa = {
   Background: { immediately: () => {} },
   Template: { add: () => {}, get: () => $('<div></div>') },
   TMDB: { key: () => 'k', api: (u) => u, image: () => '' },
-  Player: { play: () => {}, playlist: () => {}, runas: () => {}, callback: () => {} },
+  Player: {
+    play: () => {}, playlist: () => {}, runas: () => {}, callback: () => {},
+    listener: { follow: (name, cb) => follow(playerEvents, name, cb) }
+  },
+  PlayerVideo: {
+    listener: { follow: (name, cb) => follow(videoEvents, name, cb) },
+    video: () => ({ currentTime: 0, duration: 0 })
+  },
   Platform: { is: (n) => n === 'browser', tv: () => false, mouse: () => true, screen: () => 'mobile', any: () => true },
   Scroll: function () { this.render = () => $(); this.body = () => $(); this.minus = () => {}; this.append = () => {}; this.update = () => {}; this.clear = () => {}; this.destroy = () => {}; },
   Explorer: function () { this.render = () => $(); this.appendFiles = () => {}; this.appendHead = () => {}; this.destroy = () => {}; },
@@ -111,7 +130,8 @@ const Lampa = {
   SettingsApi: {
     addComponent: (c) => { settingsAdded.push({ kind: 'component', ...c }); },
     addParam: (p) => { settingsAdded.push({ kind: 'param', name: p.param.name }); }
-  }
+  },
+  ContentRows: { add: (row) => { contentRows.push(row); } }
 };
 
 const Navigator = { canmove: () => false, move: () => {} };
@@ -154,15 +174,17 @@ const checks = [
   ['component is constructor', typeof kpComponentRegistered === 'function'],
   ['lang keys >= 10', langKeys.length >= 10],
   ['kp_watch translation present', langKeys.includes('kp_watch')],
-  ['listener follow=full', listenerFollow && listenerFollow.name === 'full'],
-  ['listener has cb', listenerFollow && typeof listenerFollow.cb === 'function'],
+  ['listener follow=full', listenerFollows.some((x) => x.name === 'full')],
+  ['listener has cb', listenerFollows.some((x) => typeof x.cb === 'function')],
   ['settings component added', settingsAdded.some((s) => s.kind === 'component')],
   ['settings has log url', settingsAdded.some((s) => s.kind === 'param' && s.name === 'kp_log_url')],
   ['settings has max quality', settingsAdded.some((s) => s.kind === 'param' && s.name === 'kp_max_quality')],
   ['settings has format', settingsAdded.some((s) => s.kind === 'param' && s.name === 'kp_format')],
   ['settings has login', settingsAdded.some((s) => s.kind === 'param' && s.name === 'kp_action_login')],
+  ['settings has bookmark refresh', settingsAdded.some((s) => s.kind === 'param' && s.name === 'kp_action_sync')],
+  ['bookmark content row registered', contentRows.some((r) => r.name === 'kinopub_bookmarks')],
   ['default max_quality stored', storage['kp_max_quality'] === '1080'],
-  ['default format stored', storage['kp_format'] === 'http']
+  ['default format stored', storage['kp_format'] === 'auto']
 ];
 
 let pass = 0, fail = 0;
@@ -172,9 +194,10 @@ for (const [name, val] of checks) {
 }
 
 // Try invoking the listener with a fake card to ensure button mount path runs
-if (listenerFollow && listenerFollow.cb) {
+const fullListener = listenerFollows.find((x) => x.name === 'full');
+if (fullListener && fullListener.cb) {
   try {
-    listenerFollow.cb({
+    fullListener.cb({
       type: 'complite',
       data: { movie: { id: 1, title: 'Movie', original_title: 'Movie', name: '' } },
       object: { activity: { render: () => $() } }
@@ -185,6 +208,23 @@ if (listenerFollow && listenerFollow.cb) {
     console.error('FAIL listener.cb threw:', e.stack || e);
     fail++;
   }
+}
+
+// A KinoPub play element must emit a marktime request after 30+ seconds.
+try {
+  storage.kp_token = 'test-token';
+  (playerEvents.start || []).forEach((cb) => cb({ _kpSync: { id: 42, video: 3, season: 1 } }));
+  (videoEvents.timeupdate || []).forEach((cb) => cb({ current: 61, duration: 3600 }));
+  (playerEvents.destroy || []).forEach((cb) => cb({}));
+  const progressRequest = requests.find((r) => /\/v1\/watching\/marktime\?/.test(r.url));
+  const progressOk = progressRequest && /id=42/.test(progressRequest.url) &&
+    /video=3/.test(progressRequest.url) && /time=61/.test(progressRequest.url) && /season=1/.test(progressRequest.url);
+  if (!progressOk) throw new Error('marktime request not emitted with KinoPub metadata');
+  console.log('OK   KinoPub progress request emitted');
+  pass++;
+} catch (e) {
+  console.error('FAIL KinoPub progress sync:', e.stack || e);
+  fail++;
 }
 
 // Try instantiating the component class
